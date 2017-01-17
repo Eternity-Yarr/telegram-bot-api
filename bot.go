@@ -412,6 +412,7 @@ func (bot *BotAPI) SetWebhook(config WebhookConfig) (APIResponse, error) {
 	if config.Certificate == nil {
 		v := url.Values{}
 		v.Add("url", config.URL.String())
+		v.Add("max_connections", strconv.Itoa(100))
 
 		return bot.MakeRequest("setWebhook", v)
 	}
