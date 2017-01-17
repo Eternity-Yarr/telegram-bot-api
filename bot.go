@@ -419,6 +419,7 @@ func (bot *BotAPI) SetWebhook(config WebhookConfig) (APIResponse, error) {
 
 	params := make(map[string]string)
 	params["url"] = config.URL.String()
+	params["max_connections"] = strconv.Itoa(100)
 
 	resp, err := bot.UploadFile("setWebhook", params, "certificate", config.Certificate)
 	if err != nil {
