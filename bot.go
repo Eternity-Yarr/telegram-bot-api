@@ -19,14 +19,27 @@ import (
 	"github.com/technoweenie/multipartstreamer"
 )
 
+const (
+	DEFAULT_OUTGOING_BUFFER_SIZE = 500
+	DEFAULT_INCOMING_BUFFER_SIZE = 100
+	DEFAULT_TIME_WAITING_FOR_BUFFERED_MESSAGES = 50 * time.Millisecond
+	DEFAULT_MAX_WORKERS_COUNT = 20
+)
+
+type MethodAndValues struct {
+	Values url.Values
+	Method string
+}
+
 // BotAPI allows you to interact with the Telegram Bot API.
 type BotAPI struct {
-	Token  string `json:"token"`
-	Debug  bool   `json:"debug"`
-	Buffer int    `json:"buffer"`
+	Token           string `json:"token"`
+	Debug           bool   `json:"debug"`
+	Buffer          int    `json:"buffer"`
 
-	Self   User         `json:"-"`
-	Client *http.Client `json:"-"`
+	Self            User         `json:"-"`
+	Client          *http.Client `json:"-"`
+	OutgoingChannel *chan MethodAndValues `json:"-"` // this buffer makes sense only in webhook mode
 }
 
 // NewBotAPI creates a new BotAPI instance.
@@ -44,7 +57,7 @@ func NewBotAPIWithClient(token string, client *http.Client) (*BotAPI, error) {
 	bot := &BotAPI{
 		Token:  token,
 		Client: client,
-		Buffer: 100,
+		Buffer: DEFAULT_INCOMING_BUFFER_SIZE,
 	}
 
 	self, err := bot.GetMe()
@@ -236,7 +249,7 @@ func (bot *BotAPI) GetMe() (User, error) {
 //
 // It requires the Message.
 func (bot *BotAPI) IsMessageToMe(message Message) bool {
-	return strings.Contains(message.Text, "@"+bot.Self.UserName)
+	return strings.Contains(message.Text, "@" + bot.Self.UserName)
 }
 
 // Send will send a Chattable item to Telegram.
@@ -307,6 +320,19 @@ func (bot *BotAPI) sendFile(config Fileable) (Message, error) {
 	}
 
 	return bot.uploadAndSend(config.method(), config)
+}
+
+func (bot *BotAPI) SendChattableAsync(config Chattable) {
+	if bot.OutgoingChannel == nil {
+		panic("Not in webhook mode")
+	}
+
+	if v, err := config.values(); err == nil {
+		*bot.OutgoingChannel <- MethodAndValues{
+			Method: config.method(),
+			Values: v,
+		}
+	}
 }
 
 // sendChattable sends a Chattable.
@@ -489,9 +515,46 @@ func (bot *BotAPI) GetUpdatesChan(config UpdateConfig) (UpdatesChannel, error) {
 	return ch, nil
 }
 
+func lookForBufferedMessages(buffer *chan MethodAndValues, timeout time.Duration) (MethodAndValues, bool) {
+	timeoutCh := make(chan bool, 1)
+	go func() {
+		time.Sleep(timeout)
+		timeoutCh <- true
+	}()
+
+	select {
+	case msg := <- *buffer:
+		return msg, true
+	case <-timeoutCh:
+		return MethodAndValues{}, false
+	}
+}
+
+
+var workersSemaphore chan bool = make(chan bool, DEFAULT_MAX_WORKERS_COUNT)
+
+func (bot *BotAPI) processOutgoingQueue() {
+	workersSemaphore <- true
+	for {
+		select {
+		case data := <- *bot.OutgoingChannel:
+			go func(bot *BotAPI, mv MethodAndValues) {
+				_, err := bot.makeMessageRequest(mv.Method, mv.Values)
+				if (err != nil) {
+					log.Println("Error while sending request:", err)
+				}
+				<- workersSemaphore
+			}(bot, data)
+		}
+	}
+}
+
 // ListenForWebhook registers a http handler for a webhook.
 func (bot *BotAPI) ListenForWebhook(pattern string) UpdatesChannel {
 	ch := make(chan Update, bot.Buffer)
+
+	outgoingChannel := make(chan MethodAndValues, DEFAULT_OUTGOING_BUFFER_SIZE)
+	bot.OutgoingChannel = &outgoingChannel
 
 	http.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 		bytes, _ := ioutil.ReadAll(r.Body)
@@ -500,6 +563,17 @@ func (bot *BotAPI) ListenForWebhook(pattern string) UpdatesChannel {
 		json.Unmarshal(bytes, &update)
 
 		ch <- update
+		if data, exists := lookForBufferedMessages(bot.OutgoingChannel, DEFAULT_TIME_WAITING_FOR_BUFFERED_MESSAGES); exists {
+			log.Println("Answering directly to webhook:", data)
+			v := data.Values
+
+			v.Add("method", data.Method)
+			w.Header().Add("Content-Type", "application/x-www-form-urlencoded")
+			w.Write([]byte(v.Encode()))
+
+		} else {
+			log.Println("No messages in buffer, releasing webhook")
+		}
 	})
 
 	return ch
